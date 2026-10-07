@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "nejcc.what-changed",
+  "name": "What changed",
+  "version": "0.1.0",
+  "author": "Nejcc",
+  "license": "MIT",
+  "description": "A timeline of what changed on this machine lately: pacman transactions, edited config files, plugin installs and Omarchy updates",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "What changed",
+    "description": "History icon with a timeline of recent package, config, plugin and Omarchy changes",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false,
+    "defaults": { "days": 7 },
+    "schema": [
+      {
+        "key": "days",
+        "type": "integer",
+        "label": "Days to look back",
+        "min": 1,
+        "max": 90,
+        "step": 1,
+        "defaultValue": 7,
+        "description": "How far back the timeline reaches."
+      }
+    ]
+  }
+}

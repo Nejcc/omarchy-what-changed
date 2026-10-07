@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# What changed on this machine lately: one time-sorted timeline of pacman
+# transactions, edited config files, Omarchy plugin installs/updates and
+# Omarchy version changes. Read-only.
+#
+#   what-changed [--days N] [--since EPOCH] [--json]
+#
+# Environment overrides (used by the tests): WHAT_CHANGED_PACMAN_LOG,
+# WHAT_CHANGED_CONFIG_DIR, WHAT_CHANGED_PLUGINS_DIR, WHAT_CHANGED_MAX_CONFIG.
+set -uo pipefail
+
+days=7
+since=""
+json=false
+while (($#)); do
+  case $1 in
+  --days)
+    days=${2:-7}
+    shift
+    ;;
+  --since)
+    since=${2:-}
+    shift
+    ;;
+  --json) json=true ;;
+  -h | --help)
+    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  *)
+    echo "what-changed: unknown option $1" >&2
+    exit 2
+    ;;
+  esac
+  shift
+done
+[[ $days =~ ^[0-9]+$ ]] || days=7
+[[ $since =~ ^[0-9]+$ ]] || since=$(($(date +%s) - days * 86400))
+
+pacman_log=${WHAT_CHANGED_PACMAN_LOG:-/var/log/pacman.log}
+config_dir=${WHAT_CHANGED_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}}
+plugins_dir=${WHAT_CHANGED_PLUGINS_DIR:-$config_dir/omarchy/plugins}
+max_config=${WHAT_CHANGED_MAX_CONFIG:-80}
+
+# Every source prints records as: epoch<TAB>kind<TAB>summary<TAB>json-object.
+
+jstr() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/}
+  printf '"%s"' "$s"
+}
+
+# Pacman transactions: everything between "transaction started" and
+# "transaction completed" is one entry. A transaction that never completes
+# (a new one starts, the log says interrupted/failed, or the log ends) is
+# reported with that status instead of being dropped.
+packages() {
+  [[ -r $pacman_log ]] || return 0
+  gawk -v since="$since" '
+    function esc(s) {
+      gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/\t/, "\\t", s)
+      gsub(/[\001-\037]/, "", s)
+      return s
+    }
+    function epoch(line,   e, off, sign) {
+      if (substr(line, 12, 1) != "T") return -1
+      e = mktime(substr(line, 2, 4) " " substr(line, 7, 2) " " substr(line, 10, 2) " " \
+        substr(line, 13, 2) " " substr(line, 16, 2) " " substr(line, 19, 2), 1)
+      off = substr(line, 21, 5)
+      if (off ~ /^[+-][0-9][0-9][0-9][0-9]$/) {
+        sign = substr(off, 1, 1) == "-" ? -1 : 1
+        e -= sign * (substr(off, 2, 2) * 3600 + substr(off, 4, 2) * 60)
+      }
+      return e
+    }
+    function flush(status,   i, items, counts, summary, ops, k, sep, o) {
+      open = 0
+      if (start < since || (n == 0 && status == "completed")) return
+      split("upgraded installed removed downgraded reinstalled", ops, " ")
+      for (k = 1; k <= 5; k++) if (count[ops[k]]) summary = summary (summary ? ", " : "") count[ops[k]] " " ops[k]
+      if (summary == "") summary = "no packages changed"
+      if (status != "completed") summary = summary " (" status ")"
+      for (i = 1; i <= n; i++) {
+        items = items sep "{\"op\":\"" op[i] "\",\"name\":\"" esc(name[i]) "\",\"from\":\"" esc(from[i]) "\",\"to\":\"" esc(to[i]) "\"}"
+        sep = ","
+        if (name[i] == "omarchy" || name[i] == "omarchy-dev") {
+          o = op[i] == "removed" ? "Omarchy removed" : from[i] != "" ? "Omarchy " from[i] " -> " to[i] : "Omarchy " to[i] " " op[i]
+          printf "%d\tomarchy\t%s\t{\"ts\":%d,\"kind\":\"omarchy\",\"summary\":\"%s\",\"detail\":[\"%s\"]}\n", start, o, start, esc(o), esc(txcmd)
+        }
+      }
+      printf "%d\tpackage\t%s\t{\"ts\":%d,\"kind\":\"package\",\"summary\":\"%s\",\"command\":\"%s\",\"status\":\"%s\",\"items\":[%s]}\n", \
+        start, (txcmd != "" ? txcmd ": " : "") summary, start, esc(summary), esc(txcmd), status, items
+      delete count
+    }
+    BEGIN { cutoff = strftime("%Y-%m-%d", since - 86400, 1) }
+    # Cheap string compare first so a years-long log costs one pass, no mktime.
+    substr($0, 2, 10) < cutoff { next }
+    match($0, /^\[[^]]*\] \[([A-Za-z-]+)\] (.*)$/, m) {
+      src = m[1]; msg = m[2]
+      if (src == "PACMAN" && msg ~ /^Running /) {
+        cmd = msg; sub(/^Running ./, "", cmd); sub(/.$/, "", cmd)
+        next
+      }
+      if (src != "ALPM") next
+      if (msg == "transaction started") {
+        if (open) flush("interrupted")
+        t = epoch($0); if (t < 0) next
+        open = 1; start = t; n = 0; txcmd = cmd; cmd = ""
+      } else if (msg == "transaction completed") {
+        if (open) flush("completed")
+      } else if (msg ~ /^transaction (interrupted|failed|aborted)/) {
+        if (open) flush("interrupted")
+      } else if (open && match(msg, /^(installed|upgraded|removed|downgraded|reinstalled) ([^ ]+) \((.*)\)$/, p)) {
+        n++; op[n] = p[1]; name[n] = p[2]; count[p[1]]++
+        if (index(p[3], " -> ")) { from[n] = substr(p[3], 1, index(p[3], " -> ") - 1); to[n] = substr(p[3], index(p[3], " -> ") + 4) }
+        else { from[n] = ""; to[n] = p[3] }
+      }
+    }
+    END { if (open) flush("unfinished") }
+  ' "$pacman_log"
+}
+
+# Config files edited inside the window. The ignore list is the noise that
+# rewrites itself on every app start: caches, browser and Electron profiles,
+# state/log/lock files. Plugin checkouts are covered by the plugin source.
+config_files() {
+  [[ -d $config_dir ]] || return 0
+  local ignore=(
+    "*[Cc]ache*" "*-state" "*.state" "*.log" "logs" "*.lock" "lock" "*.tmp" "*.swp" "*~"
+    "chromium" "google-chrome*" "BraveSoftware" "vivaldi*" "microsoft-edge*" "opera*" "mozilla" "zen"
+    "Code" "Code - OSS" "VSCodium" "Cursor" "Windsurf" "discord" "Slack" "Signal" "obsidian"
+    "spotify" "1Password" "Bitwarden" "Electron" "Typora" "zoom*"
+    "Local Storage" "Session Storage" "IndexedDB" "blob_storage" "Crashpad" "GPUCache"
+    "pulse" "dconf" "session" "sessions" ".git" "Trash" "*.bak.*" "*history*"
+    "*-journal" "*-wal" "*-shm" "*.db" "*.sqlite*" "*.ttf" "*.otf" "*.png" "*.jpg" "*.webp"
+  )
+  local args=() pat d
+  for pat in "${ignore[@]}"; do args+=(-name "$pat" -o); done
+  # Anything that looks like a Chromium/Electron profile is app state, not
+  # config, whatever the app is called.
+  for d in "$config_dir"/*/; do
+    [[ -e $d/Cookies || -e "$d/Local State" || -e "$d/Network Persistent State" ]] && args+=(-path "${d%/}" -o)
+  done
+  find "$config_dir" -mindepth 1 \( "${args[@]}" -path "$plugins_dir" -o -path "$config_dir/omarchy/shell.json" \) -prune \
+    -o -type f -newermt "@$since" -printf '%T@\t%P\0' 2>/dev/null |
+    sort -z -t $'\t' -k1,1nr | head -z -n "$max_config" |
+    gawk -v RS='\0' -v base="$config_dir" '
+      function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); gsub(/\t/, "\\t", s); gsub(/[\001-\037]/, "", s); return s }
+      {
+        t = int(substr($0, 1, index($0, "\t") - 1)); rel = substr($0, index($0, "\t") + 1)
+        if (rel ~ /[\001-\037]/) next
+        printf "%d\tconfig\t%s\t{\"ts\":%d,\"kind\":\"config\",\"summary\":\"%s\",\"path\":\"%s\"}\n", t, rel, t, esc(rel), esc(base "/" rel)
+      }'
+}
+
+# Reflog entries of one git checkout: clone = installed, merge/pull = updated
+# (with the incoming commit subjects), reset = rolled back. Times are when it
+# happened on this machine, not when upstream committed.
+reflog_entries() {
+  local dir=$1 label=$2 kind=$3 old new ts msg action summary detail subj sep
+  [[ -r $dir/.git/logs/HEAD ]] || return 0
+  while IFS=$'\t' read -r old new ts msg; do
+    ((ts >= since)) || continue
+    case $msg in
+    clone:*) action="installed" ;;
+    merge* | pull*) action="updated" ;;
+    reset:*) action="reset" ;;
+    checkout:*) action="switched" ;;
+    *) continue ;;
+    esac
+    summary="$label $action"
+    detail=""
+    if [[ $action != installed && $old != "$new" && $old != 0000000* ]]; then
+      summary+=" ${old:0:7} -> ${new:0:7}"
+      sep=""
+      while IFS= read -r subj; do
+        detail+="$sep$(jstr "$subj")"
+        sep=","
+      done < <(git -C "$dir" log --no-merges --format=%s -n 20 "$old..$new" 2>/dev/null)
+    fi
+    printf '%s\t%s\t%s\t{"ts":%s,"kind":"%s","summary":%s,"detail":[%s]}\n' \
+      "$ts" "$kind" "$summary" "$ts" "$kind" "$(jstr "$summary")" "$detail"
+  done < <(gawk -F'\t' '{ n = split($1, a, " "); print a[1] "\t" a[2] "\t" a[n - 1] "\t" $2 }' "$dir/.git/logs/HEAD")
+}
+
+plugins() {
+  local dir id shell_json
+  if [[ -d $plugins_dir ]]; then
+    for dir in "$plugins_dir"/*/; do
+      [[ -d $dir ]] || continue
+      dir=${dir%/}
+      id=${dir##*/}
+      if [[ -r $dir/.git/logs/HEAD ]]; then
+        reflog_entries "$dir" "$id" plugin
+      elif [[ ! -d $dir/.git ]] && (($(stat -c %Y "$dir") >= since)); then
+        # ponytail: a non-git copy only tells us its folder mtime.
+        local t
+        t=$(stat -c %Y "$dir")
+        printf '%s\tplugin\t%s\t{"ts":%s,"kind":"plugin","summary":%s,"detail":[]}\n' "$t" "$id changed" "$t" "$(jstr "$id changed")"
+      fi
+    done
+  fi
+  # Enabling, disabling and rearranging plugins all rewrite shell.json.
+  shell_json=$config_dir/omarchy/shell.json
+  if [[ -f $shell_json ]]; then
+    local t
+    t=$(stat -c %Y "$shell_json")
+    ((t >= since)) && printf '%s\tplugin\t%s\t{"ts":%s,"kind":"plugin","summary":"Plugins or bar layout changed","path":%s,"detail":[]}\n' \
+      "$t" "Plugins or bar layout changed" "$t" "$(jstr "$shell_json")"
+  fi
+  return 0
+}
+
+# Omarchy package upgrades come out of the pacman log; this covers a dev
+# checkout ($OMARCHY_PATH as a git repo) and the last `omarchy update` run.
+omarchy() {
+  local path=${OMARCHY_PATH:-/usr/share/omarchy} t
+  path=${path%/}
+  [[ $path != /usr/share/omarchy ]] && reflog_entries "$path" "Omarchy (dev)" omarchy
+  if [[ -z ${WHAT_CHANGED_PACMAN_LOG:-} && -f /tmp/omarchy-update.log ]]; then
+    t=$(stat -c %Y /tmp/omarchy-update.log)
+    ((t >= since)) && printf '%s\tomarchy\t%s\t{"ts":%s,"kind":"omarchy","summary":"omarchy update ran","detail":[]}\n' \
+      "$t" "omarchy update ran" "$t"
+  fi
+  return 0
+}
+
+records() {
+  packages
+  config_files
+  plugins
+  omarchy
+}
+
+sorted=$(records | sort -t $'\t' -k1,1nr -s)
+
+if $json; then
+  printf '['
+  [[ -n $sorted ]] && cut -f4- <<<"$sorted" | paste -sd,
+  printf ']\n'
+else
+  while IFS=$'\t' read -r t kind summary _; do
+    [[ -n $t ]] || continue
+    printf '%s  %-8s %s\n' "$(date -d "@$t" '+%F %H:%M')" "$kind" "$summary"
+  done <<<"$sorted"
+fi
