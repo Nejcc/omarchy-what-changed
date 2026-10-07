@@ -14,6 +14,14 @@ omarchy plugin add https://github.com/Nejcc/omarchy-what-changed.git
 
 Then add the "What changed" widget to the bar.
 
+## Uninstall
+
+```sh
+omarchy plugin remove nejcc.what-changed
+```
+
+Nothing is left behind.
+
 ## Usage
 
 - Click the icon to open the timeline. Click again or press Escape to close it.
