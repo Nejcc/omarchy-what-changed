@@ -2,6 +2,8 @@
 
 A history icon in the Omarchy bar. Click it and you get a timeline of what changed on this machine lately, newest first and grouped by day: pacman transactions, config files you edited, plugins you installed or updated, and Omarchy updates.
 
+![Preview](preview.png)
+
 ## Why
 
 It worked yesterday. What did I touch? The answer is spread over `/var/log/pacman.log`, a pile of mtimes under `~/.config` and the git checkouts of your plugins. This puts them on one timeline.
